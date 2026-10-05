@@ -20,7 +20,7 @@ BUILD = ROOT / "build"
 LANGS = ["rus", "eng", "osd"]  # osd нужен для автоповорота страниц
 
 SPEC = """
-a = Analysis([{script!r}], datas=[({tesseract!r}, "tesseract")],
+a = Analysis([{script!r}], datas=[({tesseract!r}, "tesseract"), ({fonts!r}, "assets/fonts")],
              excludes=["tkinter"])  # в Windows окно выбора файла системное, tkinter не нужен
 # видеомодуль OpenCV (ffmpeg, ~30 МБ) конвертеру не нужен
 a.binaries = [b for b in a.binaries if "opencv_videoio_ffmpeg" not in b[0]]
@@ -67,7 +67,8 @@ def main():
 
     spec = BUILD / "PDF2Word.spec"
     spec.write_text(SPEC.format(script=str(ROOT / "pdf2word.py"), tesseract=str(tesseract_dst),
-                                icon=str(ROOT / "assets" / "icon.ico")), encoding="utf-8")
+                                fonts=str(ROOT / "assets" / "fonts"), icon=str(ROOT / "assets" / "icon.ico")),
+                    encoding="utf-8")
     PyInstaller.__main__.run([str(spec), "--distpath", str(ROOT / "dist"),
                               "--workpath", str(BUILD / "pyinstaller"), "--noconfirm", "--clean"])
     print(f"\nГотово: {ROOT / 'dist' / 'PDF2Word.exe'}")
