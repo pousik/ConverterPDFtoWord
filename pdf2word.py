@@ -62,6 +62,8 @@ XHTML = "{http://www.w3.org/1999/xhtml}"
 # «Вес» шагов в прогресс-баре, чтобы проценты шли примерно равномерно по времени
 COST_OCR, COST_ANALYZE, COST_PARSE, COST_BUILD = 25, 1, 2, 1
 
+# Tesseract, встроенный в PDF2Word.exe (см. build_exe.py)
+BUNDLED_TESSERACT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "tesseract"
 WINDOWS_TESSERACT = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -73,7 +75,10 @@ WINDOWS_TESSERACT = [
 
 def setup_tesseract(lang):
     """Находит tesseract.exe и оставляет только установленные языки."""
-    if not shutil.which("tesseract"):
+    if (BUNDLED_TESSERACT / "tesseract.exe").exists():
+        pytesseract.pytesseract.tesseract_cmd = str(BUNDLED_TESSERACT / "tesseract.exe")
+        os.environ["TESSDATA_PREFIX"] = str(BUNDLED_TESSERACT / "tessdata")
+    elif not shutil.which("tesseract"):
         for path in WINDOWS_TESSERACT:
             if os.path.exists(path):
                 pytesseract.pytesseract.tesseract_cmd = path
@@ -361,9 +366,44 @@ def open_file(path):
         print(f"Не удалось открыть файл автоматически: {e}")
 
 
+def pick_pdf_windows():
+    """Стандартное окно Windows «Открыть файл» (через comdlg32, без tkinter)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
+                    ("hInstance", wintypes.HINSTANCE), ("lpstrFilter", ctypes.c_void_p),
+                    ("lpstrCustomFilter", ctypes.c_void_p), ("nMaxCustFilter", wintypes.DWORD),
+                    ("nFilterIndex", wintypes.DWORD), ("lpstrFile", ctypes.c_void_p),
+                    ("nMaxFile", wintypes.DWORD), ("lpstrFileTitle", ctypes.c_void_p),
+                    ("nMaxFileTitle", wintypes.DWORD), ("lpstrInitialDir", ctypes.c_void_p),
+                    ("lpstrTitle", ctypes.c_void_p), ("Flags", wintypes.DWORD),
+                    ("nFileOffset", wintypes.WORD), ("nFileExtension", wintypes.WORD),
+                    ("lpstrDefExt", ctypes.c_void_p), ("lCustData", wintypes.LPARAM),
+                    ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", ctypes.c_void_p),
+                    ("pvReserved", ctypes.c_void_p), ("dwReserved", wintypes.DWORD),
+                    ("FlagsEx", wintypes.DWORD)]
+
+    def wide(text):
+        return (ctypes.c_wchar * len(text))(*text)
+
+    filters = wide("PDF (*.pdf)\0*.pdf\0Все файлы\0*.*\0\0")
+    title = wide("Выберите PDF для конвертации в Word\0")
+    path = ctypes.create_unicode_buffer(32768)
+    ofn = OPENFILENAMEW(lStructSize=ctypes.sizeof(OPENFILENAMEW),
+                        hwndOwner=ctypes.windll.kernel32.GetConsoleWindow(),
+                        lpstrFilter=ctypes.addressof(filters), lpstrFile=ctypes.addressof(path),
+                        nMaxFile=len(path), lpstrTitle=ctypes.addressof(title),
+                        Flags=0x00081808)  # EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST | NOCHANGEDIR
+    return path.value if ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)) else ""
+
+
 def pick_pdf():
     """Окно выбора PDF (если файл не передан в командной строке)."""
     try:
+        if sys.platform == "win32":
+            return pick_pdf_windows()
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
@@ -376,6 +416,9 @@ def pick_pdf():
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # вывод в файл: в Windows иначе cp1252 и кириллица не пишется
+        if stream and not stream.isatty():
+            stream.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description="Конвертер PDF -> DOCX с распознаванием сканов")
     ap.add_argument("pdf", nargs="?", help="PDF-файл (если не указан — откроется окно выбора)")
     ap.add_argument("docx", nargs="?", help="куда сохранить (по умолчанию рядом с PDF)")
