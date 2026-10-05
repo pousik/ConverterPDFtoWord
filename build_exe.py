@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 r"""
-Сборка PDF2Word.exe для Windows: один файл со встроенным Tesseract OCR и иконкой.
+Сборка PDF2Word.exe для Windows со встроенным Tesseract OCR и иконкой.
 
     pip install -r requirements.txt pyinstaller
     python build_exe.py                        # Tesseract из C:\Program Files\Tesseract-OCR
     python build_exe.py "D:\Tesseract-OCR"     # или из своей папки
+    python build_exe.py --onefile              # один exe-файл (запускается дольше)
 
-Результат: dist\PDF2Word.exe — на другом компьютере ничего устанавливать не нужно.
+Результат: папка dist\PDF2Word с PDF2Word.exe — на другом компьютере ничего устанавливать не нужно.
 """
+import argparse
 import shutil
 import sys
 from pathlib import Path
@@ -20,12 +22,19 @@ BUILD = ROOT / "build"
 LANGS = ["rus", "eng", "osd"]  # osd нужен для автоповорота страниц
 
 SPEC = """
+# tkinter не нужен (в Windows окно выбора файла системное), Pillow — тоже
 a = Analysis([{script!r}], datas=[({tesseract!r}, "tesseract"), ({fonts!r}, "assets/fonts")],
-             excludes=["tkinter"])  # в Windows окно выбора файла системное, tkinter не нужен
+             excludes=["tkinter", "PIL"])
 # видеомодуль OpenCV (ffmpeg, ~30 МБ) конвертеру не нужен
 a.binaries = [b for b in a.binaries if "opencv_videoio_ffmpeg" not in b[0]]
-exe = EXE(PYZ(a.pure), a.scripts, a.binaries, a.datas, name="PDF2Word",
-          icon={icon!r}, console=True, upx=False)
+pyz = PYZ(a.pure)
+"""
+ONEFILE = """
+exe = EXE(pyz, a.scripts, a.binaries, a.datas, name="PDF2Word", icon={icon!r}, console=True, upx=False)
+"""
+ONEDIR = """
+exe = EXE(pyz, a.scripts, exclude_binaries=True, name="PDF2Word", icon={icon!r}, console=True, upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, name="PDF2Word", upx=False)
 """
 
 
@@ -61,17 +70,23 @@ def copy_tesseract(src, dst):
 def main():
     if not sys.stdout.isatty():  # вывод в файл: в Windows иначе cp1252 и кириллица не пишется
         sys.stdout.reconfigure(encoding="utf-8")
-    tesseract_src = Path(sys.argv[1] if len(sys.argv) > 1 else r"C:\Program Files\Tesseract-OCR")
+    ap = argparse.ArgumentParser(description="Сборка PDF2Word.exe")
+    ap.add_argument("tesseract", nargs="?", default=r"C:\Program Files\Tesseract-OCR", help="папка Tesseract-OCR")
+    ap.add_argument("--onefile", action="store_true",
+                    help="один exe-файл (удобно передавать, но каждый запуск дольше на распаковку)")
+    args = ap.parse_args()
     tesseract_dst = BUILD / "tesseract"
-    copy_tesseract(tesseract_src, tesseract_dst)
+    copy_tesseract(Path(args.tesseract), tesseract_dst)
 
     spec = BUILD / "PDF2Word.spec"
-    spec.write_text(SPEC.format(script=str(ROOT / "pdf2word.py"), tesseract=str(tesseract_dst),
-                                fonts=str(ROOT / "assets" / "fonts"), icon=str(ROOT / "assets" / "icon.ico")),
+    template = SPEC + (ONEFILE if args.onefile else ONEDIR)
+    spec.write_text(template.format(script=str(ROOT / "pdf2word.py"), tesseract=str(tesseract_dst),
+                                    fonts=str(ROOT / "assets" / "fonts"), icon=str(ROOT / "assets" / "icon.ico")),
                     encoding="utf-8")
     PyInstaller.__main__.run([str(spec), "--distpath", str(ROOT / "dist"),
                               "--workpath", str(BUILD / "pyinstaller"), "--noconfirm", "--clean"])
-    print(f"\nГотово: {ROOT / 'dist' / 'PDF2Word.exe'}")
+    result = ROOT / "dist" / ("PDF2Word.exe" if args.onefile else "PDF2Word/PDF2Word.exe")
+    print(f"\nГотово: {result}")
 
 
 if __name__ == "__main__":

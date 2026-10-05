@@ -23,17 +23,16 @@ import statistics
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pymupdf
-import pytesseract
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Emu, Pt
 from docx.text.paragraph import Paragraph
-from PIL import Image
 from tqdm import tqdm
 
 # служебные сообщения PyMuPDF и INFO-логи pdf2docx ломают прогресс-бар — прячем их
@@ -61,6 +60,9 @@ BUNDLED_TESSERACT = APP_DIR / "tesseract"  # Tesseract, встроенный в 
 OCR_FONTS = {False: APP_DIR / "assets" / "fonts" / "LiberationSerif-Regular.ttf",  # метрики как у
              True: APP_DIR / "assets" / "fonts" / "LiberationSerif-Bold.ttf"}       # Times New Roman
 MIN_CHARS = 20          # меньше букв/цифр на странице -> считаем её сканом
+WORKERS = min(os.cpu_count() or 1, 8)  # сканы распознаются параллельно, по странице на ядро
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # а сам Tesseract — в один поток: так в сумме быстрее
+TESSERACT_ARGS = ["--oem", "1", "-c", "tessedit_do_invert=0"]  # LSTM; белый текст на чёрном не ищем
 SIZE_FACTOR = 1.08      # x_size строки от Tesseract -> кегль шрифта (подобрано на тестах)
 XHTML = "{http://www.w3.org/1999/xhtml}"
 # «Вес» шагов в прогресс-баре, чтобы проценты шли примерно равномерно по времени
@@ -83,19 +85,26 @@ WINDOWS_TESSERACT = [
 
 # ----------------------------------------------------------------------------- OCR
 
+class TesseractError(RuntimeError):
+    pass
+
+
+TESSERACT = "tesseract"  # путь к программе, уточняется в setup_tesseract
+
+
 def setup_tesseract(lang):
     """Находит tesseract.exe и оставляет только установленные языки."""
+    global TESSERACT
     if (BUNDLED_TESSERACT / "tesseract.exe").exists():
-        pytesseract.pytesseract.tesseract_cmd = str(BUNDLED_TESSERACT / "tesseract.exe")
+        TESSERACT = str(BUNDLED_TESSERACT / "tesseract.exe")
         os.environ["TESSDATA_PREFIX"] = str(BUNDLED_TESSERACT / "tessdata")
-    elif not shutil.which("tesseract"):
-        for path in WINDOWS_TESSERACT:
-            if os.path.exists(path):
-                pytesseract.pytesseract.tesseract_cmd = path
-                break
+    else:
+        TESSERACT = shutil.which("tesseract") or next((p for p in WINDOWS_TESSERACT if os.path.exists(p)), "")
     try:
-        installed = set(pytesseract.get_languages())
-    except pytesseract.TesseractNotFoundError:
+        listing = subprocess.run([TESSERACT, "--list-langs"], capture_output=True,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        installed = {code.strip() for code in listing.stdout.decode("utf-8", "replace").splitlines()[1:]} - {""}
+    except OSError:
         sys.exit("Для распознавания сканов нужен Tesseract OCR, но он не найден.\n"
                  "Установите его: https://github.com/UB-Mannheim/tesseract/wiki "
                  "(при установке отметьте язык Russian).")
@@ -131,16 +140,41 @@ def rotate(img, angle, border=255):
     return cv2.warpAffine(img, matrix, (w, h), flags=cv2.INTER_LINEAR, borderValue=(border,) * 3)
 
 
+def tesseract(img, lang, *args):
+    """Запускает Tesseract на картинке из памяти: через stdin, без временных файлов и сжатия в PNG."""
+    run = subprocess.run([TESSERACT, "stdin", "stdout", "-l", lang, *args],
+                         input=cv2.imencode(".bmp", img)[1].tobytes(), capture_output=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if run.returncode:
+        raise TesseractError(run.stderr.decode("utf-8", "replace").strip())
+    return run.stdout.decode("utf-8", "replace")
+
+
+def osd_rotation(gray):
+    """На сколько градусов по часовой повернуть страницу (OSD Tesseract, по уменьшенной копии)."""
+    half = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    try:
+        return int(re.search(r"Rotate: (\d+)", tesseract(half, "osd", "--psm", "0", "--dpi", "150")).group(1))
+    except (TesseractError, AttributeError):
+        return 0  # слишком мало текста для определения ориентации
+
+
+def ink_profiles(small):
+    """Неравномерность «чернил» по строкам и по столбцам: у строк текста профиль «полосатый»."""
+    ink = (small < 160).astype(np.float32)
+    rows, cols = ink.sum(axis=1), ink.sum(axis=0)
+    return float(rows.std() / (rows.mean() + 1e-6)), float(cols.std() / (cols.mean() + 1e-6))
+
+
 def skew_angle(gray):
     """Наклон скана: при верном угле строки текста дают самые резкие «пики» в сумме по строкам."""
+    def best(img, angles):
+        ink = (img < 160).astype(np.float32)
+        return float(max(angles, key=lambda a: (float(np.var(rotate(ink, a, border=0).sum(axis=1))), -abs(a))))
+
+    coarse = best(cv2.resize(gray, None, fx=0.125, fy=0.125, interpolation=cv2.INTER_AREA), np.arange(-5, 5.01, 0.5))
     small = cv2.resize(gray, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
-    ink = (small < 160).astype(np.float32)
-
-    def sharpness(angle):
-        return float(np.var(rotate(ink, angle, border=0).sum(axis=1))), -abs(angle)  # при равенстве — 0°
-
-    coarse = max(np.arange(-5, 5.01, 0.5), key=sharpness)
-    return float(max(np.arange(coarse - 0.5, coarse + 0.51, 0.05), key=sharpness))
+    return best(small, np.arange(coarse - 0.5, coarse + 0.51, 0.1))
 
 
 def stroke_width(ink, box):
@@ -185,64 +219,90 @@ def words_box(words):
 
 
 def recover_missed(clean, ink, rules_mask, lines, lang, dpi):
-    """Дочитывает то, что Tesseract пропустил: одиночные цифры в ячейках таблиц, номера страниц и т.п.
-    Все такие кусочки собираются полосками на одну картинку и распознаются за один запуск."""
+    """Второй проход: дочитывает то, что Tesseract пропустил (одиночные цифры в ячейках таблиц, номера
+    страниц), и перечитывает короткие слова, в которых он не уверен. Все кусочки собираются полосками
+    на одну картинку и распознаются за один запуск."""
     if not lines:
         return []
     x_size = int(statistics.median(line["x_size"] for line in lines))
-    left = ink.copy()
-    left[rules_mask > 0] = 0
+    leftover = ink.copy()
+    leftover[rules_mask > 0] = 0
     near = x_size // 2 + 4  # кусочки вплотную к словам — это «хвосты» уже распознанных букв (№, Р...)
     for line in lines:
         for word in line["words"]:
             x0, y0, x1, y1 = (int(v) for v in word["box"])
-            left[max(y0 - 4, 0):y1 + 4, max(x0 - near, 0):x1 + near] = 0
-    merged = cv2.dilate(left, np.ones((3, max(x_size * 3 // 5, 1)), np.uint8))  # буквы слова — в один кусок
-    crops, pad = [], x_size // 3
+            leftover[max(y0 - 4, 0):y1 + 4, max(x0 - near, 0):x1 + near] = 0
+    merged = cv2.dilate(leftover, np.ones((3, max(x_size * 3 // 5, 1)), np.uint8))  # буквы слова — в кусок
+    crops, pad = [], x_size // 3  # (x, y, картинка, слово для перечитывания или None)
     for x, y, w, h, _ in cv2.connectedComponentsWithStats(merged)[2][1:]:
         if 0.4 * x_size <= h <= 1.8 * x_size and w <= dpi * 2 and len(crops) < 50:
             x0, y0 = max(x - pad, 0), max(y - pad, 0)
-            crops.append((x0, y0, clean[y0:y + h + pad, x0:x + w + pad]))
+            crops.append((x0, y0, clean[y0:y + h + pad, x0:x + w + pad], None))
+    for line in lines:
+        words = line["words"]
+        for j, word in enumerate(words):  # короткое слово «на отшибе» (ячейка таблицы, номер), Tesseract не уверен
+            alone = (j == 0 or word["box"][0] - words[j - 1]["box"][2] > x_size) and \
+                    (j == len(words) - 1 or words[j + 1]["box"][0] - word["box"][2] > x_size)
+            if alone and len(word["text"]) <= 3 and word["text"] != "•" and word["conf"] < 80 and len(crops) < 100:
+                x0, y0, x1, y1 = (int(v) for v in word["box"])
+                x0, y0 = max(x0 - 6, 0), max(y0 - pad, 0)
+                crops.append((x0, y0, clean[y0:y1 + pad, x0:x1 + 6], word))
     if not crops:
         return []
 
-    canvas = np.full((sum(c.shape[0] + x_size for *_, c in crops) + x_size,
-                      max(c.shape[1] for *_, c in crops) + 2 * x_size), 255, np.uint8)
+    canvas = np.full((sum(c[2].shape[0] + x_size for c in crops) + x_size,
+                      max(c[2].shape[1] for c in crops) + 2 * x_size), 255, np.uint8)
     bands, top = [], x_size
-    for x0, y0, crop in crops:
+    for x0, y0, crop, _ in crops:
         canvas[top:top + crop.shape[0], x_size:x_size + crop.shape[1]] = crop
         bands.append((top, top + crop.shape[0], x0 - x_size, y0 - top))
         top += crop.shape[0] + x_size
-    data = pytesseract.image_to_data(Image.fromarray(canvas), lang=lang, config="--oem 1 --psm 6",
-                                     output_type=pytesseract.Output.DICT)
+    tsv = tesseract(canvas, lang, *TESSERACT_ARGS, "--psm", "6", "--dpi", str(dpi), "tsv")
     found = {}
-    for i, text in enumerate(data["text"]):
-        text, conf = text.strip(), float(data["conf"][i])
+    for row in tsv.splitlines()[1:]:
+        cells = row.split("\t")
+        if len(cells) < 12:
+            continue
+        x, y, width, height = (int(v) for v in cells[6:10])
+        text, conf = cells[11].strip(), float(cells[10])
         if not text or conf < 70 or not any(ch.isalnum() for ch in text):
             continue
-        middle = data["top"][i] + data["height"][i] / 2
+        middle = y + height / 2
         for band, (y_top, y_bottom, dx, dy) in enumerate(bands):
             if y_top <= middle <= y_bottom:
-                box = [data["left"][i] + dx, data["top"][i] + dy,
-                       data["left"][i] + data["width"][i] + dx, data["top"][i] + data["height"][i] + dy]
+                box = [x + dx, y + dy, x + width + dx, y + height + dy]
                 found.setdefault(band, []).append({"box": box, "text": text, "conf": conf})
-    dark = clean < 128
-    return [{"words": sorted(words, key=lambda w: w["box"][0]), "base": max(w["box"][3] for w in words),
-             "x_size": x_size, "stroke": stroke_width(dark, words_box(words)) / x_size}
-            for words in found.values()]
+
+    dark, new_lines = clean < 128, []
+    for band, words in found.items():
+        target = crops[band][3]
+        if target is None:  # пропущенный кусок текста — новая строка
+            new_lines.append({"words": sorted(words, key=lambda w: w["box"][0]), "base": max(w["box"][3] for w in words),
+                              "x_size": x_size, "stroke": stroke_width(dark, words_box(words)) / x_size})
+        elif len(words) == 1 and words[0]["conf"] > target["conf"] + 10:  # перечитанное слово увереннее
+            target["text"], target["conf"] = words[0]["text"], words[0]["conf"]
+    return new_lines
 
 
-def recognize(page, lang, dpi):
-    """Распознаёт страницу-скан: строки слов с кеглем и жирностью, линии таблиц и картинки."""
+def render(page, dpi):
+    """Картинка страницы (PyMuPDF не потокобезопасен, поэтому рендер — только в основном потоке)."""
     pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
-    color = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
+
+
+def turn_image(img, turn):
+    """Поворот на turn градусов по часовой (кратно 90)."""
+    return np.ascontiguousarray(np.rot90(img, -turn // 90)) if turn else img
+
+
+def recognize(color, lang, dpi, check_turn=True):
+    """Распознаёт страницу-скан: строки слов с кеглем и жирностью, линии таблиц и картинки."""
     gray = cv2.medianBlur(cv2.cvtColor(color, cv2.COLOR_RGB2GRAY), 3)  # убирает «пыль» скана
-    try:  # автоповорот страниц, отсканированных боком или вверх ногами
-        turn = pytesseract.image_to_osd(Image.fromarray(gray), output_type=pytesseract.Output.DICT)["rotate"]
-    except pytesseract.TesseractError:
-        turn = 0  # слишком мало текста для определения ориентации
-    if turn:
-        color, gray = (np.ascontiguousarray(np.rot90(img, -turn // 90)) for img in (color, gray))
+    rows, cols = ink_profiles(cv2.resize(gray, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA))
+    if check_turn and cols > rows * 1.2:  # строки идут вертикально — похоже, страница отсканирована боком
+        turn = osd_rotation(gray)
+        if turn:
+            return recognize(turn_image(color, turn), lang, dpi, check_turn=False)
     angle = skew_angle(gray)
     if abs(angle) > 0.05:  # выравниваем наклон: строки и линии таблиц становятся строго горизонтальными
         color, gray = rotate(color, angle), rotate(gray, angle)
@@ -254,8 +314,7 @@ def recognize(page, lang, dpi):
     clean = gray.copy()
     clean[rules_mask > 0] = 255  # без линий Tesseract намного лучше читает текст в ячейках таблиц
 
-    hocr = pytesseract.image_to_pdf_or_hocr(Image.fromarray(clean), lang=lang, config="--oem 1 --psm 3",
-                                            extension="hocr")
+    hocr = tesseract(clean, lang, *TESSERACT_ARGS, "--psm", "3", "--dpi", str(dpi), "hocr")
     dark = clean < 128
     lines = []
     for par in ET.fromstring(hocr).iter(f"{XHTML}p"):
@@ -277,6 +336,12 @@ def recognize(page, lang, dpi):
             par_lines.append({"words": words, "base": box[3] + (hocr_value(line, "baseline") or [0, 0])[1],
                               "x_size": x_size, "stroke": stroke_width(dark, box) / x_size})
         lines += join_hyphenated(par_lines)
+
+    confs = [w["conf"] for line in lines for w in line["words"] if any(ch.isalnum() for ch in w["text"])]
+    if check_turn and len(confs) >= 10 and statistics.mean(confs) < 55:  # «каша» — может, вверх ногами?
+        turn = osd_rotation(gray)
+        if turn:
+            return recognize(turn_image(color, turn), lang, dpi, check_turn=False)
     lines += recover_missed(clean, ink, rules_mask, lines, lang, dpi)
 
     # жирный шрифт: штрихи заметно толще, чем у основного текста страницы
@@ -321,9 +386,34 @@ def recognize(page, lang, dpi):
         line["words"] = [w for w in line["words"] if w["conf"] >= 70 or not in_figure(w)]
     lines = [line for line in lines if line["words"]]
     rules = [r for r in rules if not in_figure({"box": r[:4]})]  # края столбиков графика — не таблица
+    return {"size": (gray.shape[1], gray.shape[0]), "k": 72 / dpi, "lines": lines, "rules": rules,
+            "figures": figures, "chars": sum(len(w["text"]) for line in lines for w in line["words"])}
 
-    # кегль: по ширине слов (шрифт метрически как Times New Roman), проверяя по высоте строки
-    k = 72 / dpi
+
+def recognize_pages(src, pages, lang, dpi, on_done):
+    """Распознаёт страницы параллельно: рендер — в основном потоке, остальное — в рабочих.
+    Одновременно в памяти не больше картинок, чем рабочих потоков. on_done(номер, результат)
+    вызывается в основном потоке сразу по готовности страницы, пока остальные ещё распознаются."""
+    done, queue, running = 0, iter(pages), {}
+    with ThreadPoolExecutor(WORKERS) as pool:
+        def submit():
+            i = next(queue, None)
+            if i is not None:
+                running[pool.submit(recognize, render(src[i], dpi), lang, dpi)] = i
+
+        for _ in range(WORKERS):
+            submit()
+        while running:
+            for future in wait(running, return_when=FIRST_COMPLETED)[0]:
+                i = running.pop(future)
+                submit()  # следующую страницу — в работу сразу, до обработки готовой
+                done += 1
+                on_done(i, future.result(), done)
+
+
+def assign_sizes(ocr):
+    """Кегль строк: по ширине слов (шрифт метрически как Times New Roman), с проверкой по высоте строки."""
+    k, lines = ocr["k"], ocr["lines"]
     for line in lines:
         by_height = line["x_size"] * k * SIZE_FACTOR
         natural = sum(ocr_font(line["bold"]).text_length(w["text"], 1) for w in line["words"])
@@ -334,8 +424,6 @@ def recognize(page, lang, dpi):
     common = statistics.mode(sizes) if sizes else 0
     for line, size in zip(lines, sizes):
         line["size"] = min(max(common if abs(size - common) <= common * 0.07 else size, 4), 72)
-    return {"size": (gray.shape[1], gray.shape[0]), "k": k, "lines": lines, "rules": rules,
-            "figures": figures, "chars": sum(len(w["text"]) for line in lines for w in line["words"])}
 
 
 @functools.lru_cache(maxsize=None)
@@ -347,19 +435,19 @@ def draw_ocr_page(doc, pno, ocr):
     """Вставляет распознанную страницу как обычную PDF-страницу: настоящий текст на тех же местах,
     линии таблиц и картинки. Дальше её, как и остальные страницы, разбирает pdf2docx."""
     k = ocr["k"]
+    assign_sizes(ocr)
     page = doc.new_page(pno, width=ocr["size"][0] * k, height=ocr["size"][1] * k)
     for box, png in ocr["figures"]:
         page.insert_image(pymupdf.Rect(box) * k, stream=png)
     for x0, y0, x1, y1, thick in ocr["rules"]:
         page.draw_line((x0 * k, y0 * k), (x1 * k, y1 * k), width=max(thick * k, 0.5))
-    for bold in (False, True):
-        page.insert_font(fontname=f"ocr{int(bold)}", fontfile=str(OCR_FONTS[bold]))
+    writer = pymupdf.TextWriter(page.rect)  # весь текст страницы — одной операцией, это быстро
     for line in ocr["lines"]:
-        size, font, fontname = line["size"], ocr_font(line["bold"]), f"ocr{int(line['bold'])}"
+        size, font = line["size"], ocr_font(line["bold"])
         base, space = line["base"] * k, font.text_length(" ", line["size"])
         words, x = line["words"], line["words"][0]["box"][0] * k
         for word, after in zip(words, words[1:] + [None]):  # каждое слово — на своё место
-            page.insert_text((x, base), word["text"], fontsize=size, fontname=fontname)
+            writer.append((x, base), word["text"], font=font, fontsize=size)
             end = x + font.text_length(word["text"], size)
             if not after:
                 break
@@ -367,7 +455,8 @@ def draw_ocr_page(doc, pno, ocr):
             # пробел — посередине промежутка, как при выравнивании по ширине в Word; в широких
             # промежутках (колонки, «должность ____ ФИО») пробела нет: это разные части строки
             if x - end < size * 2:
-                page.insert_text(((end + x - space) / 2, base), " ", fontsize=size, fontname=fontname)
+                writer.append(((end + x - space) / 2, base), " ", font=font, fontsize=size)
+    writer.write_text(page)
 
 
 # ----------------------------------------------------------------------------- конвертация
@@ -467,16 +556,22 @@ def convert(pdf_path, docx_path, lang="rus+eng", dpi=300, force_ocr=False):
 
     # 1. Сканы распознаём и заменяем «чистыми» страницами с настоящим текстом
     work = src
+    def progress(done, total):
+        bar.set_postfix_str(f"распознавание текста: {done}/{total} стр.")
+        bar.update(COST_OCR)
+
     if scans:
         work = pymupdf.open()
         work.insert_pdf(src)
-        for i in scans:
-            bar.set_postfix_str(f"стр. {i + 1}/{n}: распознавание текста")
-            ocr = recognize(src[i], lang, dpi)
-            if ocr["chars"] >= MIN_CHARS or force_ocr:  # иначе текста нет (например, фото) — оставляем как есть
+        bar.set_postfix_str(f"распознавание текста: 0/{len(scans)} стр.")
+
+        def replace_page(i, ocr, done):
+            if ocr["chars"] >= MIN_CHARS or force_ocr:  # иначе текста нет (например, фото) — как есть
                 draw_ocr_page(work, i, ocr)
                 work.delete_page(i + 1)
-            bar.update(COST_OCR)
+            progress(done, len(scans))
+
+        recognize_pages(src, scans, lang, dpi, replace_page)
 
     # 2. Разбор вёрстки всех страниц через pdf2docx
     cv = Converter(stream=work.tobytes()) if work is not src else Converter(pdf_path, password=password)
@@ -497,11 +592,15 @@ def convert(pdf_path, docx_path, lang="rus+eng", dpi=300, force_ocr=False):
     if failed:  # страницы, на которых pdf2docx сломался, распознаём как сканы
         lang = setup_tesseract(lang)
         bar.total += len(failed) * COST_OCR
-        retry = pymupdf.open()
+        retry, recognized = pymupdf.open(), {}
+
+        def keep(i, ocr, done):
+            recognized[i] = ocr
+            progress(done, len(failed))
+
+        recognize_pages(src, failed, lang, dpi, keep)
         for i in failed:
-            bar.set_postfix_str(f"стр. {i + 1}/{n}: распознавание текста")
-            draw_ocr_page(retry, -1, recognize(src[i], lang, dpi))
-            bar.update(COST_OCR)
+            draw_ocr_page(retry, -1, recognized[i])
         cv_retry = Converter(stream=retry.tobytes())
         cv_retry.load_pages().parse_document(**settings)
         for i, page in zip(failed, cv_retry.pages):
