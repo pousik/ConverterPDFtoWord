@@ -7,10 +7,11 @@ PDF -> Word (DOCX): конвертер с распознаванием скан�
     python pdf2word.py документ.pdf -o итог.docx    -> свой путь (или -o папка)
     python pdf2word.py                              -> откроется окно выбора файлов
 
-Страницы с текстовым слоем конвертирует pdf2docx (сохраняются шрифты, таблицы,
-картинки). Страницы-сканы распознаёт Tesseract OCR: текст, линии таблиц и картинки
-переносятся на «чистую» PDF-страницу, которую затем так же разбирает pdf2docx —
-получаются обычные редактируемые абзацы, таблицы и рисунки. Существующие файлы
+По умолчанию — точная копия страниц (fixed_layout.py): каждая страница PDF становится страницей
+Word, на которой текст, таблицы, рамка документа и штамп стоят там же, где в PDF, и не сдвигаются;
+текст и таблицы редактируются. С --flow вёрстку собирает pdf2docx (сплошной текст, который Word
+раскладывает сам). Страницы-сканы распознаёт Tesseract OCR: текст и линии таблиц переносятся
+на «чистую» PDF-страницу, которая дальше обрабатывается как обычная. Существующие файлы
 никогда не перезаписываются: если имя занято, результат получит имя «файл (1).docx».
 """
 import argparse
@@ -41,6 +42,8 @@ from docx.oxml.ns import qn
 from docx.shared import Emu, Pt
 from docx.text.paragraph import Paragraph
 from tqdm import tqdm
+
+import fixed_layout
 
 # служебные сообщения PyMuPDF и INFO-логи pdf2docx ломают прогресс-бар — прячем их
 pymupdf.set_messages(pylogging=True, pylogging_level=logging.DEBUG)
@@ -73,7 +76,7 @@ SIZE_FACTOR = 1.08      # x_size строки от Tesseract -> кегль шр�
 XHTML = "{http://www.w3.org/1999/xhtml}"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp", ".jp2", ".jpx"}
 # «Вес» шагов в прогресс-баре, чтобы проценты шли примерно равномерно по времени
-COST_OCR, COST_ANALYZE, COST_PARSE, COST_BUILD = 25, 1, 2, 1
+COST_OCR, COST_ANALYZE, COST_PARSE, COST_BUILD, COST_FIXED = 25, 1, 2, 1, 3
 
 # маркеры списков из шрифтов Symbol/Wingdings (частная область Unicode) -> обычные символы
 SYMBOL_BULLETS = {"symbol": {"\uf0b7": "•"},
@@ -876,49 +879,45 @@ def page_lost_text(page, expected):
     return expected >= MIN_CHARS and docx_chars(probe.element.body) < 0.5 * expected
 
 
-def convert(pdf_path, out=None, lang="rus+eng", dpi=300, force_ocr=False):
-    """Конвертирует один PDF (или картинку); out — файл .docx или папка (по умолчанию рядом с PDF).
-    Возвращает путь сохранённого DOCX."""
-    src = open_pdf(pdf_path)
-    docx_path, overwrite = output_path(pdf_path, out)
-    docx_path, overwrite = writable_target(docx_path, overwrite)
-    n = len(src)
-    scans = [i for i in range(n) if force_ocr or not has_text_layer(src[i])]
-    ocr_lang, ocr_error = None, None
-    if scans:
-        try:
-            ocr_lang = setup_tesseract(lang)
-        except OcrUnavailable as e:
-            ocr_error = str(e)
-            warn(ocr_error)
-    print(f"Страниц: {n}, с текстом: {n - len(scans)}, сканов (OCR): {len(scans)}")
+def fixed_ok(page):
+    """Страницу можно переносить по частям: текст читаемый и не спрятан под картинкой-сканом."""
+    chars = visible_text(page)
+    if chars.count("\ufffd") >= max(sum(ch.isalnum() for ch in chars), 1):
+        return False
+    try:
+        return not any(abs(pymupdf.Rect(info["bbox"]) & page.rect) > 0.5 * abs(page.rect)
+                       for info in page.get_image_info())
+    except Exception:  # noqa: BLE001
+        return False
 
-    bar = tqdm(total=(len(scans) if ocr_lang else 0) * COST_OCR + n * (COST_ANALYZE + COST_PARSE + COST_BUILD),
-               desc="Конвертация", bar_format="{desc}: {percentage:3.0f}%|{bar}| {elapsed}<{remaining}{postfix}",
-               file=sys.stderr, disable=sys.stderr is None)
 
-    def progress(done, total):
-        bar.set_postfix_str(f"распознавание текста: {done}/{total} стр.")
-        bar.update(COST_OCR)
+def build_fixed(work, unreplaced, bar):
+    """Фиксированная вёрстка (по умолчанию): каждая страница PDF — страница Word, на которой текст, таблицы,
+    рамка и штамп стоят точно там же, где в PDF, и никуда не уезжают."""
+    doc = Document()
+    fixed_layout.prepare(doc)
+    n = len(work)
+    for i in range(n):
+        bar.set_postfix_str(f"стр. {i + 1}/{n}: вёрстка")
+        first = i == 0
+        if i in unreplaced and not fixed_ok(work[i]):  # скан без распознанного текста — картинкой
+            fixed_layout.add_image_page(doc, work, i, first)
+        else:
+            try:
+                layout = fixed_layout.layout_page(*fixed_layout.normalize(work, i))
+            except Exception as e:  # noqa: BLE001 — нестандартная страница: лучше картинкой, чем никак
+                warn(f"Стр. {i + 1}: не удалось разобрать ({e}) — вставлена картинкой")
+                fixed_layout.add_image_page(doc, work, i, first)
+            else:
+                fixed_layout.place_page(doc, *layout, first)
+        bar.update(COST_FIXED)
+    return doc
 
-    # 1. Копия документа (со всеми слоями и без шифрования), в которой сканы заменяются «чистыми» страницами
-    work = pymupdf.open("pdf", src.tobytes(encryption=pymupdf.PDF_ENCRYPT_NONE))
-    if scans and ocr_lang:
-        bar.set_postfix_str(f"распознавание текста: 0/{len(scans)} стр.")
-        done = [0]
 
-        def replace_page(i, ocr, size_dpi):
-            done[0] += 1
-            if isinstance(ocr, Exception):
-                warn(f"Стр. {i + 1}: не удалось распознать ({str(ocr).strip()[:200]}) — оставлена картинкой")
-            elif ocr["chars"] >= MIN_CHARS or force_ocr:  # иначе текста нет (например, фото) — как есть
-                draw_ocr_page(work, i, ocr, size_dpi)
-                work.delete_page(i + 1)
-            progress(done[0], len(scans))
-
-        recognize_pages(src, scans, ocr_lang, dpi, replace_page)
-
-    # 2. Разбор вёрстки всех страниц через pdf2docx (неудачные — повторно через OCR, затем картинкой)
+def build_flow(src, work, scans, ocr_lang, ocr_error, lang, dpi, bar, progress):
+    """Обычная вёрстка (--flow): pdf2docx собирает сплошной текст, таблицы и картинки, которые Word
+    раскладывает сам. Удобнее для правки длинных текстов, но положение строк и рамок может «поплыть»."""
+    n = len(work)
     settings = Converter.default_settings.fget(None)  # свойство pdf2docx, экземпляр ему не нужен
     bar.set_postfix_str("анализ структуры документа")
     pages, failed = parse_pages(work.tobytes(garbage=1), settings)
@@ -938,8 +937,7 @@ def convert(pdf_path, out=None, lang="rus+eng", dpi=300, force_ocr=False):
         try:
             ocr_lang = setup_tesseract(lang)
         except OcrUnavailable as e:
-            ocr_error = str(e)
-            warn(ocr_error)
+            warn(str(e))
     if failed:
         retry, recognized = pymupdf.open(), {}
         if retry_ocr and ocr_lang:
@@ -969,7 +967,6 @@ def convert(pdf_path, out=None, lang="rus+eng", dpi=300, force_ocr=False):
                 pages[i] = None
                 warn(f"Стр. {i + 1}: не удалось перенести страницу")
 
-    # 3. Сборка DOCX
     doc = Document()
     body = doc.element.body
     for i, page in enumerate(pages):
@@ -984,6 +981,60 @@ def convert(pdf_path, out=None, lang="rus+eng", dpi=300, force_ocr=False):
                 warn(f"Стр. {i + 1}: не удалось собрать страницу ({e})")
         bar.update(COST_BUILD)
     polish_docx(doc)
+    return doc
+
+
+def convert(pdf_path, out=None, lang="rus+eng", dpi=300, force_ocr=False, flow=False):
+    """Конвертирует один PDF (или картинку); out — файл .docx или папка (по умолчанию рядом с PDF).
+    flow=True — обычная вёрстка через pdf2docx вместо фиксированной. Возвращает путь сохранённого DOCX."""
+    src = open_pdf(pdf_path)
+    docx_path, overwrite = output_path(pdf_path, out)
+    docx_path, overwrite = writable_target(docx_path, overwrite)
+    n = len(src)
+    scans = [i for i in range(n) if force_ocr or not has_text_layer(src[i])]
+    ocr_lang, ocr_error = None, None
+    if scans:
+        try:
+            ocr_lang = setup_tesseract(lang)
+        except OcrUnavailable as e:
+            ocr_error = str(e)
+            warn(ocr_error)
+    print(f"Страниц: {n}, с текстом: {n - len(scans)}, сканов (OCR): {len(scans)}")
+
+    per_page = COST_ANALYZE + COST_PARSE + COST_BUILD if flow else COST_FIXED
+    bar = tqdm(total=(len(scans) if ocr_lang else 0) * COST_OCR + n * per_page,
+               desc="Конвертация", bar_format="{desc}: {percentage:3.0f}%|{bar}| {elapsed}<{remaining}{postfix}",
+               file=sys.stderr, disable=sys.stderr is None)
+
+    def progress(done, total):
+        bar.set_postfix_str(f"распознавание текста: {done}/{total} стр.")
+        bar.update(COST_OCR)
+
+    # 1. Копия документа (со всеми слоями и без шифрования), в которой сканы заменяются «чистыми» страницами
+    #    с распознанным текстом на тех же местах
+    work = pymupdf.open("pdf", src.tobytes(encryption=pymupdf.PDF_ENCRYPT_NONE))
+    replaced = set()
+    if scans and ocr_lang:
+        bar.set_postfix_str(f"распознавание текста: 0/{len(scans)} стр.")
+        done = [0]
+
+        def replace_page(i, ocr, size_dpi):
+            done[0] += 1
+            if isinstance(ocr, Exception):
+                warn(f"Стр. {i + 1}: не удалось распознать ({str(ocr).strip()[:200]}) — оставлена картинкой")
+            elif ocr["chars"] >= MIN_CHARS or force_ocr:  # иначе текста нет (например, фото) — как есть
+                draw_ocr_page(work, i, ocr, size_dpi)
+                work.delete_page(i + 1)
+                replaced.add(i)
+            progress(done[0], len(scans))
+
+        recognize_pages(src, scans, ocr_lang, dpi, replace_page)
+
+    # 2. Сборка DOCX
+    if flow:
+        doc = build_flow(src, work, scans, ocr_lang, ocr_error, lang, dpi, bar, progress)
+    else:
+        doc = build_fixed(work, set(scans) - replaced, bar)
     bar.set_postfix_str("сохранение")
     saved = save_docx(doc, docx_path, overwrite)
     bar.set_postfix_str("готово")
@@ -991,7 +1042,6 @@ def convert(pdf_path, out=None, lang="rus+eng", dpi=300, force_ocr=False):
     work.close()
     src.close()
     return saved
-
 
 
 # ----------------------------------------------------------------------------- файлы и запуск
@@ -1199,6 +1249,9 @@ def main():
     ap.add_argument("--lang", default="rus+eng", help="языки OCR через + (по умолчанию rus+eng)")
     ap.add_argument("--dpi", type=dpi_value, default=300, help="разрешение для OCR, 100-600 (по умолчанию 300)")
     ap.add_argument("--ocr", action="store_true", help="распознавать через OCR все страницы")
+    ap.add_argument("--flow", action="store_true",
+                    help="обычная вёрстка (сплошной текст) вместо точной копии страниц: удобнее править длинный "
+                         "текст, но строки, рамки и таблицы могут сдвинуться")
     ap.add_argument("--no-open", action="store_true", help="не открывать результат после конвертации")
     args = ap.parse_args()
 
@@ -1225,7 +1278,7 @@ def main():
         try:
             if not os.path.isfile(pdf_path):
                 raise UserError(f"Файл не найден: {pdf_path}")
-            result = convert(pdf_path, out, args.lang, args.dpi, args.ocr)
+            result = convert(pdf_path, out, args.lang, args.dpi, args.ocr, args.flow)
         except UserError as e:
             print(f"Ошибка: {e}")
             failed.append(pdf_path)
